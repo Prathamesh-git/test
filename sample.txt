@@ -1,0 +1,207 @@
+CREATE OR REPLACE PROCEDURE public.swap_stage_partition(
+    p_parent_table REGCLASS,
+    p_old_table    REGCLASS,
+    p_new_table    REGCLASS
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_parent_oid OID := p_parent_table::OID;
+    v_old_oid    OID := p_old_table::OID;
+    v_new_oid    OID := p_new_table::OID;
+
+    v_parent_schema TEXT;
+    v_parent_name   TEXT;
+    v_old_schema    TEXT;
+    v_old_name      TEXT;
+    v_new_schema    TEXT;
+    v_new_name      TEXT;
+
+    v_child_count INT;
+BEGIN
+
+    -- Validate parameters
+    IF v_parent_oid IS NULL
+       OR v_old_oid IS NULL
+       OR v_new_oid IS NULL THEN
+        RAISE EXCEPTION 'All three table parameters are required';
+    END IF;
+
+    IF v_old_oid = v_new_oid THEN
+        RAISE EXCEPTION 'Old and new tables cannot be identical';
+    END IF;
+
+    -- Serialize swaps for the same parent
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended(v_parent_oid::TEXT, 2001)
+    );
+
+    -- Get parent table
+    SELECT n.nspname, c.relname
+    INTO v_parent_schema, v_parent_name
+    FROM pg_class c
+    JOIN pg_namespace n
+      ON n.oid = c.relnamespace
+    WHERE c.oid = v_parent_oid
+      AND c.relkind = 'p';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Parent table must be a partitioned table';
+    END IF;
+
+    -- Get old table
+    SELECT n.nspname, c.relname
+    INTO v_old_schema, v_old_name
+    FROM pg_class c
+    JOIN pg_namespace n
+      ON n.oid = c.relnamespace
+    WHERE c.oid = v_old_oid
+      AND c.relkind = 'r';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Old staging table does not exist';
+    END IF;
+
+    -- Get new table
+    SELECT n.nspname, c.relname
+    INTO v_new_schema, v_new_name
+    FROM pg_class c
+    JOIN pg_namespace n
+      ON n.oid = c.relnamespace
+    WHERE c.oid = v_new_oid
+      AND c.relkind = 'r';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'New staging table does not exist';
+    END IF;
+
+    -- Lock parent table
+    EXECUTE FORMAT(
+        'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+        v_parent_schema,
+        v_parent_name
+    );
+
+    -- Verify exactly one partition is attached
+    SELECT COUNT(*)
+    INTO v_child_count
+    FROM pg_inherits
+    WHERE inhparent = v_parent_oid;
+
+    IF v_child_count <> 1 THEN
+        RAISE EXCEPTION
+            'Expected exactly one attached partition. Found: %',
+            v_child_count;
+    END IF;
+
+    -- Verify old table belongs to this parent
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_inherits
+        WHERE inhparent = v_parent_oid
+          AND inhrelid = v_old_oid
+    ) THEN
+        RAISE EXCEPTION
+            'Old table % is not attached to parent %',
+            p_old_table, p_parent_table;
+    END IF;
+
+    -- Verify new table is not already attached
+    IF EXISTS (
+        SELECT 1
+        FROM pg_inherits
+        WHERE inhrelid = v_new_oid
+    ) THEN
+        RAISE EXCEPTION
+            'New table % is already attached to a parent',
+            p_new_table;
+    END IF;
+
+    -- Verify column definitions match
+    IF EXISTS (
+        SELECT attnum, attname, atttypid, atttypmod,
+               attnotnull, attcollation
+        FROM pg_attribute
+        WHERE attrelid = v_parent_oid
+          AND attnum > 0
+          AND NOT attisdropped
+
+        EXCEPT
+
+        SELECT attnum, attname, atttypid, atttypmod,
+               attnotnull, attcollation
+        FROM pg_attribute
+        WHERE attrelid = v_new_oid
+          AND attnum > 0
+          AND NOT attisdropped
+    )
+    OR EXISTS (
+        SELECT attnum, attname, atttypid, atttypmod,
+               attnotnull, attcollation
+        FROM pg_attribute
+        WHERE attrelid = v_new_oid
+          AND attnum > 0
+          AND NOT attisdropped
+
+        EXCEPT
+
+        SELECT attnum, attname, atttypid, atttypmod,
+               attnotnull, attcollation
+        FROM pg_attribute
+        WHERE attrelid = v_parent_oid
+          AND attnum > 0
+          AND NOT attisdropped
+    )
+    THEN
+        RAISE EXCEPTION
+            'New staging table structure does not match parent table';
+    END IF;
+
+    -- Atomic swap
+    BEGIN
+
+        -- Detach old partition
+        EXECUTE FORMAT(
+            'ALTER TABLE %I.%I DETACH PARTITION %I.%I',
+            v_parent_schema,
+            v_parent_name,
+            v_old_schema,
+            v_old_name
+        );
+
+        RAISE NOTICE 'Detached: %.%',
+            v_old_schema, v_old_name;
+
+        -- Attach new partition
+        EXECUTE FORMAT(
+            'ALTER TABLE %I.%I ATTACH PARTITION %I.%I FOR VALUES IN (1)',
+            v_parent_schema,
+            v_parent_name,
+            v_new_schema,
+            v_new_name
+        );
+
+        RAISE NOTICE 'Attached: %.%',
+            v_new_schema, v_new_name;
+
+        -- Verify new partition is attached
+        SELECT COUNT(*)
+        INTO v_child_count
+        FROM pg_inherits
+        WHERE inhparent = v_parent_oid
+          AND inhrelid = v_new_oid;
+
+        IF v_child_count <> 1 THEN
+            RAISE EXCEPTION 'Partition swap verification failed';
+        END IF;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE WARNING 'Partition swap failed: %', SQLERRM;
+            RAISE;
+    END;
+
+    RAISE NOTICE 'Partition swap completed successfully';
+
+END;
+$$;
